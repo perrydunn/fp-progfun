@@ -1,0 +1,10 @@
+# Mac Stuff
+.DS_Store
+
+# Build Stuff
+project/
+target/
+build/
+
+# IntelliJ Stuff
+.idea/
