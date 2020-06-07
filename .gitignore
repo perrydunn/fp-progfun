@@ -5,6 +5,7 @@
 project/
 target/
 build/
+submission.jar
 
 # IntelliJ Stuff
 .idea/
