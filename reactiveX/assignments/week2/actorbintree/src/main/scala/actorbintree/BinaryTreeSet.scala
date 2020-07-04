@@ -82,13 +82,11 @@ class BinaryTreeSet extends Actor {
     */
   def garbageCollecting(newRoot: ActorRef): Receive = {
     case CopyFinished => {
-      root ! PoisonPill
       root = newRoot
       pendingQueue foreach (root ! _)
       pendingQueue = Queue.empty[Operation]
       context become normal
     }
-    case GC => ()
     case op: Operation => pendingQueue = pendingQueue enqueue op
   }
 
@@ -132,7 +130,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
         subtrees.get(Left) match {
           case Some(node) => node ! Insert(requester, id, e)
           case None => {
-            val node = context.actorOf(BinaryTreeNode.props(e, initiallyRemoved = false), s"node-$e")
+            val node = context.actorOf(BinaryTreeNode.props(e, initiallyRemoved = false))
             subtrees = subtrees + (Left -> node)
             requester ! OperationFinished(id)
           }
@@ -141,7 +139,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
         subtrees.get(Right) match {
           case Some(node) => node ! Insert(requester, id, e)
           case None => {
-            val node = context.actorOf(BinaryTreeNode.props(e, initiallyRemoved = false), s"node-$e")
+            val node = context.actorOf(BinaryTreeNode.props(e, initiallyRemoved = false))
             subtrees = subtrees + (Right -> node)
             requester ! OperationFinished(id)
           }
@@ -183,6 +181,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
     case CopyTo(treeNode) => {
       if (removed && subtrees.isEmpty) {
         context.parent ! CopyFinished
+        self ! PoisonPill
       } else {
         subtrees foreachEntry ((_, node) => node ! CopyTo(treeNode))
         if (!removed) {
@@ -203,14 +202,15 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
     case OperationFinished(_) =>
       if (expected.isEmpty) {
         context.parent ! CopyFinished
+        self ! PoisonPill
       } else {
         context become copying(expected, insertConfirmed = true)
       }
     case CopyFinished =>
       val nowExpected = expected - sender
-      sender ! PoisonPill
       if (nowExpected.isEmpty && insertConfirmed) {
         context.parent ! CopyFinished
+        self ! PoisonPill
       } else {
         context become copying(nowExpected, insertConfirmed)
       }
