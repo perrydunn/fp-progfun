@@ -3,9 +3,7 @@ package kvstore
 import akka.actor.{Actor, ActorRef, OneForOneStrategy, PoisonPill, Props, SupervisorStrategy, Terminated}
 import akka.actor.Timers
 import kvstore.Arbiter._
-// import akka.pattern.{ask, pipe}
 import scala.concurrent.duration._
-// import akka.util.Timeout
 
 object Replica {
   sealed trait Operation {
@@ -21,7 +19,7 @@ object Replica {
   case class OperationFailed(id: Long) extends OperationReply
   case class GetResult(key: String, valueOption: Option[String], id: Long) extends OperationReply
 
-  case class UpdateTimedOut(id: Long, requester: ActorRef)
+  case class UpdateTimedOut(id: Long)
   case object RetryOutstandingPersistence
 
   case class UpdateOperationStatus(
@@ -38,11 +36,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   import Replica._
   import Replicator._
   import Persistence._
-  import context.dispatcher
-
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
 
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
@@ -54,7 +47,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   context.watch(this.persister)
   timers.startTimerAtFixedRate("Retry Persistence", RetryOutstandingPersistence, 100.milliseconds)
 
-  // I added this
   override def preStart(): Unit = {
     arbiter ! Join
   }
@@ -69,23 +61,42 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case JoinedSecondary => context become replica(0L)
   }
 
+  // Map from ID to its status
   var updateOperations = Map.empty[Long, UpdateOperationStatus]
 
-  /* TODO Behavior for  the leader role. */
+  def performUpdateOperation(key: String, valueOption: Option[String], id: Long) = {
+    timers.startSingleTimer(id, UpdateTimedOut(id), 1.second)
+    valueOption match {
+      case Some(value) => this.kv += (key -> value)
+      case None => this.kv -= key
+    }
+    this.updateOperations += (id -> UpdateOperationStatus(sender, key, valueOption, false, this.replicators))
+    this.persister ! Persist(key, valueOption, id)
+    this.replicators foreach { _ ! Replicate(key, valueOption, id) }
+  }
+
+  def retryOutstandingPersistence() = this.updateOperations foreach {
+    case (id, UpdateOperationStatus(_, key, valueOption, persisted, _)) =>
+      if (!persisted) this.persister ! Persist(key, valueOption, id)
+  }
+
+  def completePersistence(id: Long, messageToSend: Any) = this.updateOperations get id foreach {
+    case UpdateOperationStatus(client, key, valueOption, _, replicators) =>
+      if (replicators.isEmpty) {
+        this.updateOperations -= id
+        timers.cancel(id)
+        client ! messageToSend
+      } else {
+        this.updateOperations += (id -> UpdateOperationStatus(client, key, valueOption, true, replicators))
+      }
+  }
+
   val leader: Receive = {
     case Insert(key, value, id) =>
-      timers.startSingleTimer(id, UpdateTimedOut(id, sender), 1.second)
-      this.updateOperations += (id -> UpdateOperationStatus(sender, key, Some(value), false, this.replicators))
-      this.kv += (key -> value)
-      this.persister ! Persist(key, Some(value), id)
-      this.replicators foreach { _ ! Replicate(key, Some(value), id) }
+      performUpdateOperation(key, Some(value), id)
 
     case Remove(key, id) =>
-      timers.startSingleTimer(id, UpdateTimedOut(id, sender), 1.second)
-      this.updateOperations += (id -> UpdateOperationStatus(sender, key, None, false, this.replicators))
-      this.kv -= key
-      this.persister ! Persist(key, None, id)
-      this.replicators foreach { _ ! Replicate(key, None, id) }
+      performUpdateOperation(key, None, id)
 
     case Get(key, id) =>
       sender ! GetResult(key, this.kv.get(key), id)
@@ -124,17 +135,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         }
       } yield replica -> replicator).toMap
 
-    case Persisted(_, id) =>
-      this.updateOperations get id foreach {
-        case UpdateOperationStatus(client, key, valueOption, _, replicators) =>
-          if (replicators.isEmpty) {
-            this.updateOperations -= id
-            timers.cancel(id)
-            client ! OperationAck(id)
-          } else {
-            this.updateOperations += (id -> UpdateOperationStatus(client, key, valueOption, true, replicators))
-          }
-      }
+    case Persisted(_, id) => completePersistence(id, OperationAck(id))
 
     case Replicated(_, id) =>
       this.updateOperations get id foreach {
@@ -149,11 +150,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
           }
       }
 
-    case RetryOutstandingPersistence =>
-      this.updateOperations foreach {
-        case (id, UpdateOperationStatus(_, key, valueOption, persisted, _)) =>
-          if (!persisted) this.persister ! Persist(key, valueOption, id)
-      }
+    case RetryOutstandingPersistence => retryOutstandingPersistence()
 
     case Terminated =>
       this.updateOperations foreach {
@@ -161,47 +158,27 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
           this.persister ! Persist(key, valueOption, id)
       }
 
-    case UpdateTimedOut(id, client) =>
-      if (this.updateOperations.isDefinedAt(id)) {
-        this.updateOperations -= id
-        timers.cancel(id)
-        client ! OperationFailed(id)
+    case UpdateTimedOut(id) =>
+      this.updateOperations get id foreach {
+        case UpdateOperationStatus(client, _, _, _, _) => client ! OperationFailed(id)
       }
   }
 
-  var snapshotsToReplicator = Map.empty[Long, ActorRef]
-  // I changed this to def replica(seq: Long) from val replica
-  /* TODO Behavior for the replica role. */
   def replica(expectedSeq: Long): Receive = {
     case Get(key, id) =>
       sender ! GetResult(key, this.kv get key, id)
 
     case Snapshot(key, valueOption, seq) =>
       if (seq == expectedSeq) {
-        valueOption match {
-          case Some(value) =>
-            this.kv += (key -> value)
-          case None =>
-            this.kv -= key
-        }
-        this.persister ! Persist(key, valueOption, seq)
-        timers.startTimerWithFixedDelay(seq, Persist(key, valueOption, seq), 100.milliseconds)
-        this.snapshotsToReplicator = this.snapshotsToReplicator + (seq -> sender)
+        performUpdateOperation(key, valueOption, seq)
         context become replica(expectedSeq + 1)
       } else if (seq < expectedSeq) {
         sender ! SnapshotAck(key, seq)
       }
 
-    case m @ Persist(_, _, _) =>
-      this.persister ! m
+    case Persisted(key, seq) => completePersistence(seq, SnapshotAck(key, seq))
 
-    case Persisted(key, seq) =>
-      this.snapshotsToReplicator get seq foreach { replicator =>
-        timers.cancel(seq)
-        replicator ! SnapshotAck(key, seq)
-        this.snapshotsToReplicator -= seq
-      }
+    case RetryOutstandingPersistence => retryOutstandingPersistence()
   }
 
 }
-
