@@ -77,10 +77,10 @@ object Transactor {
   private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
     Behaviors.receivePartial[PrivateCommand[T]] {
       case (_, Committed(session, value)) =>
-        if (session eq sessionRef) idle(value, sessionTimeout)
+        if (session == sessionRef) idle(value, sessionTimeout)
         else Behaviors.ignore
       case (ctx, RolledBack(session)) =>
-        if (session eq sessionRef) {
+        if (session == sessionRef) {
           ctx.stop(session)
           idle(rollbackValue, sessionTimeout)
         }
