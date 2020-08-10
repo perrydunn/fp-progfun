@@ -45,14 +45,7 @@ object Event {
     }
   }
 
-  implicit val eventOrdering: Ordering[Event] = (x: Event, y: Event) =>
-    if (x.sequenceNr < y.sequenceNr) {
-      -1
-    } else if (x.sequenceNr > y.sequenceNr) {
-      1
-    } else {
-      0
-    }
+  implicit val eventOrdering: Ordering[Event] = (x: Event, y: Event) => x.sequenceNr compare y.sequenceNr
 
   /**
    * Follow: Only the To User Id should be notified
